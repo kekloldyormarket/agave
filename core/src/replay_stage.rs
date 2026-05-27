@@ -339,6 +339,32 @@ pub struct TowerBFTStructures {
     pub epoch_slots_frozen_slots: EpochSlotsFrozenSlots,
 }
 
+/// State for batched vote submission. Tracks how many votable banks have been
+/// recorded since the last vote tx was pushed, so we can skip pushes until we
+/// hit the batch size.
+///
+/// The local `Tower` already accumulates lockouts on every votable bank;
+/// skipping `push_vote` just delays when those lockouts get serialized into a
+/// vote tx. The next push naturally carries all accumulated votes.
+#[derive(Debug, Default)]
+pub(crate) struct VoteBatchState {
+    /// Configured batch size (1 = disabled, status quo).
+    pub batch_n: u8,
+    /// Number of votable banks recorded since last push.
+    pub counter: u8,
+}
+
+impl VoteBatchState {
+    pub(crate) fn new(batch_n: u8) -> Self {
+        // Clamp to MAX_LOCKOUT_HISTORY (31). Higher would silently drop oldest
+        // votes from the tower before they reach the vote program.
+        Self {
+            batch_n: batch_n.clamp(1, 31),
+            counter: 0,
+        }
+    }
+}
+
 struct PartitionInfo {
     partition_start_time: Option<Instant>,
 }
@@ -412,6 +438,12 @@ pub struct ReplayStageConfig {
     // Stops voting until this slot has been reached. Should be used to avoid
     // duplicate voting which can lead to slashing.
     pub wait_to_vote_slot: Option<Slot>,
+    /// Batch this many votable banks into a single TowerSync transaction.
+    /// 1 = status quo (one vote tx per bank). 2 = safe default (100% credit
+    /// retention via 2-slot grace period, 50% fee savings). Higher trades
+    /// timely-vote-credits for fee savings. Forced flush on fork switches,
+    /// root advances, and impending leader slots regardless of this setting.
+    pub vote_batch_n: u8,
     pub replay_forks_threads: NonZeroUsize,
     pub replay_transactions_threads: NonZeroUsize,
     pub blockstore: Arc<Blockstore>,
@@ -727,6 +759,7 @@ impl ReplayStage {
             wait_for_vote_to_start_leader,
             tower_storage,
             wait_to_vote_slot,
+            vote_batch_n,
             replay_forks_threads,
             replay_transactions_threads,
             blockstore,
@@ -858,6 +891,7 @@ impl ReplayStage {
                 unfrozen_gossip_verified_vote_hashes,
                 epoch_slots_frozen_slots,
             };
+            let mut vote_batch_state = VoteBatchState::new(vote_batch_n);
             // AsyncVerificationProgress does a large allocation for its internal channel, so we
             // keep a free list to avoid doing one of those for each slot
             let mut async_verification_freelist = Vec::new();
@@ -1316,6 +1350,7 @@ impl ReplayStage {
                             wait_to_vote_slot,
                             migration_status.as_ref(),
                             &mut tbft_structs,
+                            &mut vote_batch_state,
                         );
                     }
                     voting_time.stop();
@@ -3017,6 +3052,7 @@ impl ReplayStage {
         wait_to_vote_slot: Option<Slot>,
         migration_status: &MigrationStatus,
         tbft_structs: &mut TowerBFTStructures,
+        vote_batch_state: &mut VoteBatchState,
     ) {
         assert!(!migration_status.is_alpenglow_enabled());
         if bank.is_empty() {
@@ -3099,19 +3135,63 @@ impl ReplayStage {
         update_commitment_cache_time.stop();
         replay_timing.update_commitment_cache_us += update_commitment_cache_time.as_us();
 
-        Self::push_vote(
-            bank,
-            vote_account_pubkey,
-            identity_keypair,
-            authorized_voter_keypairs,
-            tower,
-            switch_fork_decision,
-            tracked_vote_transactions,
-            *has_new_vote_been_rooted,
-            replay_timing,
-            voting_sender,
-            wait_to_vote_slot,
-        );
+        // === Vote batching decision ===
+        //
+        // The local Tower already holds every lockout we've recorded since
+        // the last push_vote. Skipping a push just defers the on-chain
+        // serialization; the next push naturally carries all accumulated
+        // lockouts as new votes, and the vote program awards credits per-
+        // lockout based on each landing latency.
+        //
+        // Force a flush when:
+        //   * batch_n == 1                  (feature disabled, status quo)
+        //   * counter has reached batch_n   (batch full)
+        //   * we just rooted a new bank     (don't risk stale tower)
+        //   * fork switch                   (consensus needs the switch ASAP)
+        //   * about to be leader            (our slot needs our latest vote)
+        let about_to_be_leader = leader_schedule_cache
+            .slot_leader_at(bank.slot().saturating_add(1), Some(bank))
+            .map(|leader| leader.id == identity_keypair.pubkey())
+            .unwrap_or(false);
+        let force_flush = vote_batch_state.batch_n == 1
+            || new_root.is_some()
+            || !matches!(switch_fork_decision, SwitchForkDecision::SameFork)
+            || about_to_be_leader;
+
+        vote_batch_state.counter = vote_batch_state.counter.saturating_add(1);
+        let should_push =
+            force_flush || vote_batch_state.counter >= vote_batch_state.batch_n;
+
+        if should_push {
+            datapoint_info!(
+                "vote_batch_flush",
+                ("batched_votes", vote_batch_state.counter as i64, i64),
+                ("batch_n", vote_batch_state.batch_n as i64, i64),
+                ("forced", force_flush, bool),
+                ("slot", bank.slot() as i64, i64),
+            );
+            vote_batch_state.counter = 0;
+            Self::push_vote(
+                bank,
+                vote_account_pubkey,
+                identity_keypair,
+                authorized_voter_keypairs,
+                tower,
+                switch_fork_decision,
+                tracked_vote_transactions,
+                *has_new_vote_been_rooted,
+                replay_timing,
+                voting_sender,
+                wait_to_vote_slot,
+            );
+        } else {
+            trace!(
+                "vote_batch: held vote for slot {} ({}/{} pending)",
+                bank.slot(),
+                vote_batch_state.counter,
+                vote_batch_state.batch_n,
+            );
+        }
     }
 
     fn generate_vote_tx(
