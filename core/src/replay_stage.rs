@@ -3153,8 +3153,13 @@ impl ReplayStage {
             .slot_leader_at(bank.slot().saturating_add(1), Some(bank))
             .map(|leader| leader.id == identity_keypair.pubkey())
             .unwrap_or(false);
+        // NOTE: new_root.is_some() is intentionally NOT a force-flush trigger.
+        // The local tower roots every votable bank in steady state, which would
+        // disable batching entirely. The on-chain root will lag by up to
+        // batch_n slots (~12s at N=31), which is fine — other validators do not
+        // rely on our specific vote_state.root_slot to advance their own
+        // consensus.
         let force_flush = vote_batch_state.batch_n == 1
-            || new_root.is_some()
             || !matches!(switch_fork_decision, SwitchForkDecision::SameFork)
             || about_to_be_leader;
 
@@ -3163,6 +3168,15 @@ impl ReplayStage {
             force_flush || vote_batch_state.counter >= vote_batch_state.batch_n;
 
         if should_push {
+            // Use info! (not just datapoint_info!) so we can observe batching
+            // engagement in journalctl without a metrics aggregator configured.
+            info!(
+                "vote_batch_flush: batched={} batch_n={} forced={} slot={}",
+                vote_batch_state.counter,
+                vote_batch_state.batch_n,
+                force_flush,
+                bank.slot()
+            );
             datapoint_info!(
                 "vote_batch_flush",
                 ("batched_votes", vote_batch_state.counter as i64, i64),
