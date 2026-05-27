@@ -346,22 +346,50 @@ pub struct TowerBFTStructures {
 /// The local `Tower` already accumulates lockouts on every votable bank;
 /// skipping `push_vote` just delays when those lockouts get serialized into a
 /// vote tx. The next push naturally carries all accumulated votes.
+///
+/// When `adaptive` is true, `batch_n` is recomputed each epoch boundary from
+/// the validator's current active stake using `optimal_batch_n_for_stake`.
 #[derive(Debug, Default)]
 pub(crate) struct VoteBatchState {
-    /// Configured batch size (1 = disabled, status quo).
+    /// Current batch size (1 = disabled, status quo).
     pub batch_n: u8,
     /// Number of votable banks recorded since last push.
     pub counter: u8,
+    /// When true, batch_n is recomputed from current stake each epoch.
+    pub adaptive: bool,
+    /// Last epoch we recomputed batch_n in adaptive mode.
+    pub last_recomputed_epoch: u64,
 }
 
 impl VoteBatchState {
-    pub(crate) fn new(batch_n: u8) -> Self {
+    pub(crate) fn new(batch_n: u8, adaptive: bool) -> Self {
         // Clamp to MAX_LOCKOUT_HISTORY (31). Higher would silently drop oldest
         // votes from the tower before they reach the vote program.
         Self {
             batch_n: batch_n.clamp(1, 31),
             counter: 0,
+            adaptive,
+            last_recomputed_epoch: u64::MAX,
         }
+    }
+}
+
+/// Sweet-spot lookup: optimal batch size for a given active stake (in SOL).
+///
+/// Derived empirically from on-chain credit retention vs fee-savings tradeoff
+/// at each batch size (see ../../docs/vote-batching-sweetspot.md). At low
+/// stake, fee savings dwarf credit loss → push N to the tower max. As stake
+/// grows, credit loss starts to dominate → downshift toward N=2 (lossless).
+pub(crate) fn optimal_batch_n_for_stake(stake_sol: u64) -> u8 {
+    match stake_sol {
+        0..=500 => 31,
+        501..=1_500 => 15,
+        1_501..=3_000 => 10,
+        3_001..=7_500 => 7,
+        7_501..=15_000 => 5,
+        15_001..=25_000 => 4,
+        25_001..=50_000 => 3,
+        _ => 2,
     }
 }
 
@@ -891,7 +919,11 @@ impl ReplayStage {
                 unfrozen_gossip_verified_vote_hashes,
                 epoch_slots_frozen_slots,
             };
-            let mut vote_batch_state = VoteBatchState::new(vote_batch_n);
+            // vote_batch_n == 0 means adaptive (auto-select N from active stake).
+            // Otherwise the env var pins N.
+            let adaptive = vote_batch_n == 0;
+            let initial_n = if adaptive { 31 } else { vote_batch_n };
+            let mut vote_batch_state = VoteBatchState::new(initial_n, adaptive);
             // AsyncVerificationProgress does a large allocation for its internal channel, so we
             // keep a free list to avoid doing one of those for each slot
             let mut async_verification_freelist = Vec::new();
@@ -3149,6 +3181,33 @@ impl ReplayStage {
         //   * we just rooted a new bank     (don't risk stale tower)
         //   * fork switch                   (consensus needs the switch ASAP)
         //   * about to be leader            (our slot needs our latest vote)
+        // Adaptive N: recompute batch_n from current stake at every epoch boundary.
+        // We use the bank's view of stake (not RPC) so it's fork-consistent and free.
+        if vote_batch_state.adaptive {
+            let current_epoch = bank.epoch();
+            if vote_batch_state.last_recomputed_epoch != current_epoch {
+                let stake_lamports = bank.epoch_vote_account_stake(vote_account_pubkey);
+                let stake_sol = stake_lamports / 1_000_000_000;
+                let new_n = optimal_batch_n_for_stake(stake_sol);
+                if new_n != vote_batch_state.batch_n {
+                    info!(
+                        "vote_batch_adaptive: epoch {} active_stake={} SOL, \
+                         adjusting N {} -> {}",
+                        current_epoch, stake_sol, vote_batch_state.batch_n, new_n,
+                    );
+                    datapoint_info!(
+                        "vote_batch_adaptive",
+                        ("epoch", current_epoch as i64, i64),
+                        ("active_stake_sol", stake_sol as i64, i64),
+                        ("old_n", vote_batch_state.batch_n as i64, i64),
+                        ("new_n", new_n as i64, i64),
+                    );
+                    vote_batch_state.batch_n = new_n;
+                }
+                vote_batch_state.last_recomputed_epoch = current_epoch;
+            }
+        }
+
         let about_to_be_leader = leader_schedule_cache
             .slot_leader_at(bank.slot().saturating_add(1), Some(bank))
             .map(|leader| leader.id == identity_keypair.pubkey())
